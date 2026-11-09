@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+jq -cn --args '$ARGS.positional' -- "$@" >> "$TEST_STATE/calls.jsonl"
+if [[ ${1:-} == -C ]]; then shift 2; fi
+case ${1:-} in
+    client)
+        if [[ -n ${TEST_CLIENTS:-} ]]; then
+            printf '%s\n' "$TEST_CLIENTS"
+        else
+            # A lost app and an anonymous connection must not cause ambiguity.
+            printf '%s\n' '{"clients":[
+                {"client_id":"client:lost","info":{"kind":"app"},"connection_state":"lost"},
+                {"client_id":"client:app","info":{"kind":"app"},"connection_state":"connected"},
+                {"client_id":"client:cli","info":{"kind":"cli"}},
+                {"client_id":"client:anonymous"}]}'
+        fi
+        ;;
+    actions)
+        printf '%s\n' '{"actions":[{"name":"session.select"}]}'
+        ;;
+    ls)
+        [[ ${TEST_LIST_FAIL:-0} != 1 ]] || exit 1
+        cat "$TEST_STATE/sessions.json"
+        ;;
+    new)
+        [[ ${TEST_NEW_FAIL:-0} != 1 ]] || exit 1
+        label=$2
+        [[ $3 == -c && $5 == --window && $6 == Terminal && $7 == --json ]]
+        jq --arg label "$label" --arg cwd "$4" '
+            .sessions += [{session_id: ("session:test-" + ((.sessions | length) + 1 | tostring)),
+                label: $label, cwd: $cwd}]' "$TEST_STATE/sessions.json" > "$TEST_STATE/next.json"
+        mv "$TEST_STATE/next.json" "$TEST_STATE/sessions.json"
+        jq '.sessions[-1] | {session_id}' "$TEST_STATE/sessions.json"
+        ;;
+    do)
+        [[ $2 == session.select && $3 == session_id=session:test-* ]]
+        [[ ${TEST_SWITCH_FAIL:-0} != 1 ]] || exit 1
+        ;;
+    *) printf 'Unexpected fake Rex command: %s\n' "$*" >&2; exit 1 ;;
+esac

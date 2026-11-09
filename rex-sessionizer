@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() { printf 'rex-sessionizer: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<'EOF'
+Usage: rex-sessionizer [--no-switch] [PROJECT | DIRECTORY]
+       rex-sessionizer --list
+
+Pick a project directly inside ~/Dev/personal/experiments with fzf.
+Create its Rex session on first use; reuse it on later visits.
+
+  --list        List available project names without contacting Rex.
+  --no-switch   Create or reuse the session without displaying it.
+  -h, --help    Show this help.
+
+REX_BIN overrides the Rex executable. REX_CLIENT selects the Rex app.
+Successful opens print the session ID.
+EOF
+}
+
+switch=true
+list=false
+positional=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --no-switch) switch=false ;;
+        --list) list=true ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; positional+=("$@"); break ;;
+        -*) fail "Unknown option: $1 (see --help)." ;;
+        *) positional+=("$1") ;;
+    esac
+    shift
+done
+set -- ${positional[@]+"${positional[@]}"}
+[[ $# -le 1 ]] || fail 'Expected at most one project or directory.'
+if $list && [[ $# -ne 0 ]]; then
+    fail '--list cannot be combined with a project.'
+fi
+
+root=$HOME/Dev/personal/experiments
+[[ -d $root ]] || fail "Source directory does not exist: $root"
+root=$(cd -- "$root" && pwd -P)
+
+projects=()
+for directory in "$root"/*; do
+    # Only immediate, visible directories; do not follow project symlinks.
+    [[ -d $directory && ! -L $directory ]] || continue
+    projects+=("${directory##*/}")
+done
+if $list; then
+    if [[ ${#projects[@]} -gt 0 ]]; then printf '%s\n' "${projects[@]}"; fi
+    exit 0
+fi
+
+if [[ $# -eq 1 ]]; then
+    selected=$1
+else
+    [[ ${#projects[@]} -gt 0 ]] || fail "No projects found in $root"
+    command -v fzf >/dev/null 2>&1 || fail 'Install fzf to use the project picker.'
+    selected=$(printf '%s\0' "${projects[@]}" |
+        fzf --read0 --no-multi --no-expect --no-print-query --prompt='Project> ') || {
+        status=$?
+        case $status in
+            1|130) exit 0 ;; # No match, Escape, or Control-C.
+            *) fail "fzf failed (exit $status)." ;;
+        esac
+    }
+fi
+
+case $selected in
+    /*|.|..|./*|../*) directory=$selected ;;
+    *) directory=$root/$selected ;;
+esac
+# -ef compares inodes, so case and trailing slashes cannot change the name.
+name=
+for project in ${projects[@]+"${projects[@]}"}; do
+    if [[ $directory -ef $root/$project ]]; then name=$project; break; fi
+done
+[[ -n $name ]] || fail "Choose a project directly inside $root (see --list)."
+directory=$root/$name
+
+command -v jq >/dev/null 2>&1 || fail 'Install jq to read Rex responses.'
+rex_bin=${REX_BIN:-}
+if [[ -z $rex_bin ]]; then
+    rex_bin=$(command -v rex || true)
+    if [[ -z $rex_bin ]]; then
+        for app in '/Applications/Rex.app' '/Applications/Rex Beta.app'; do
+            candidate=$app/Contents/Helpers/Rex\ Server.rex/Contents/MacOS/rex
+            if [[ -x $candidate ]]; then rex_bin=$candidate; break; fi
+        done
+    fi
+fi
+[[ -n $rex_bin ]] && command -v "$rex_bin" >/dev/null 2>&1 ||
+    fail 'Rex CLI not found. Install Rex or set REX_BIN to its executable.'
+
+# A deterministic label survives script restarts without a separate state file.
+if command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$directory" | shasum -a 256)
+elif command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$directory" | sha256sum)
+else
+    fail 'A SHA-256 tool is required (shasum or sha256sum).'
+fi
+label="$name [${digest:0:12}]"
+
+client_args=()
+if $switch; then
+    if [[ -n ${REX_CLIENT:-} ]]; then
+        client_args=(-C "$REX_CLIENT")
+    else
+        clients=$("$rex_bin" client ls --json) || fail 'Could not list Rex clients.'
+        client=$(printf '%s' "$clients" | jq -r '.clients[]? |
+            select(.info.kind == "app" and .connection_state != "lost") | .client_id')
+        [[ -n $client ]] || fail 'Open the Rex app, or use --no-switch.'
+        [[ $client != *$'\n'* ]] ||
+            fail 'Multiple Rex apps are connected. Set REX_CLIENT to the desired client ID.'
+        client_args=(-C "$client")
+    fi
+    actions=$("$rex_bin" "${client_args[@]}" actions --json) ||
+        fail 'Could not inspect the selected Rex app.'
+    printf '%s' "$actions" | jq -e 'any(.actions[]; .name == "session.select")' >/dev/null ||
+        fail 'The selected Rex app does not support session.select.'
+fi
+
+sessions=$("$rex_bin" ls --json) || fail 'Could not list Rex sessions.'
+session_id=$(printf '%s' "$sessions" | jq -r --arg label "$label" \
+    '.sessions[]? | select(.label == $label) | .session_id')
+[[ $session_id != *$'\n'* ]] ||
+    fail "Multiple sessions have the label $label; resolve the duplicate in Rex."
+if [[ -z $session_id ]]; then
+    created=$("$rex_bin" new "$label" -c "$directory" --window Terminal --json) ||
+        fail 'Could not create the project session. Check Rex before retrying.'
+    session_id=$(printf '%s' "$created" | jq -er '.session_id')
+fi
+
+if $switch; then
+    "$rex_bin" "${client_args[@]}" do session.select "session_id=$session_id" >/dev/null ||
+        fail "Session $session_id exists, but switching failed. Check the Rex app and its Remote Control setting, then retry."
+fi
+printf '%s\n' "$session_id"
